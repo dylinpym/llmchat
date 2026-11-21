@@ -1,0 +1,44 @@
+# Binaries
+/bin/
+/build/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+server
+llmchat
+
+# Test & coverage
+*.test
+*.out
+coverage.html
+coverage.out
+
+# Go workspace / tool state
+go.work
+go.work.sum
+vendor/
+.sqlc/
+
+# Secrets — never commit. Copy .env.example to .env instead.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local data
+/data/
+/local/
+
+# 本地运行产物
+*.log
+*.err

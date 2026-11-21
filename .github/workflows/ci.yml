@@ -1,0 +1,134 @@
+name: CI
+
+# Every path is covered on purpose: this repo has Go under cmd/ and internal/,
+# SQL under migrations/ and sql/, and deployment YAML. Triggering on push to the
+# default branch and on any pull request keeps "green" meaning something beyond
+# "green on my laptop", which is the entire point of having CI at all.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+# Cancel superseded runs on the same ref instead of finishing them; wastes fewer
+# CI minutes during a rapid push sequence.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Lint and static analysis. This job has no external dependencies on purpose:
+  # formatting, build and vet must fail fast and cheaply before anything heavier
+  # runs, and a formatting miss should not cost a database spin-up to discover.
+  lint:
+    name: Lint & vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # gofmt is checked first as a distinct step because a diff here is the
+      # cheapest possible failure to diagnose -- the offending file is printed.
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: build
+        run: go build ./...
+
+      # golangci-lint from its own action caches the linter itself as well as the
+      # module cache. Pinned to the major version our .golangci.yml schema targets
+      # (v2) so a silent major bump cannot change the pass/fail bar under us.
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.1
+          args: --timeout=5m
+
+  # Hermetic unit tests. Deliberately NO database service: the whole promise of
+  # the test layout is that `go test ./...` passes with zero external state,
+  # because the Postgres-backed tests skip when DATABASE_URL is unset. If a test
+  # ever starts requiring a DB here, this job turns red and tells us a unit test
+  # leaked a dependency -- which is the outcome we want to detect.
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # -race catches the data races this project has actually shipped, and
+      # -count=1 disables result caching so a re-run is a real re-run.
+      - name: Test (race, hermetic)
+        run: go test -race -count=1 ./...
+
+  # Integration tests against a real PostgreSQL. Split from the unit job so a
+  # missing/renamed migration or a schema regression is reported as its own
+  # failure, not buried inside "tests failed".
+  test-integration:
+    name: Integration tests (PostgreSQL)
+    runs-on: ubuntu-latest
+    # A real database, not a fake. The concurrency tests here (one-active-leaf
+    # under parallel appends) only mean something against a real READ COMMITTED
+    # engine with real row locks; a mock cannot reproduce them.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: llmchat
+          POSTGRES_PASSWORD: llmchat
+          POSTGRES_DB: llmchat
+        ports:
+          - 5432:5432
+        # Gate the job on the DB actually accepting connections, not just the
+        # container starting -- otherwise the first migration races Postgres's
+        # initdb and fails nondeterministically.
+        options: >-
+          --health-cmd "pg_isready -U llmchat -d llmchat"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # pgx accepts a URL DSN; the integration test skips unless this is set.
+      DATABASE_URL: postgres://llmchat:llmchat@127.0.0.1:5432/llmchat?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Apply the schema. We feed psql ONLY the goose "Up" section, not the whole
+      # file. The reason is a bug caught during authoring: piping the whole file
+      # through psql runs the "-- +goose Down" DROP TABLE statements too (goose
+      # directives are plain SQL comments to psql), so it created every table and
+      # then immediately deleted them. Extracting Up-only is deterministic, needs
+      # no goose download, and cannot silently run the teardown.
+      - name: Apply migration (Up section only)
+        run: |
+          awk '/\+goose Up/{flag=1; next} /\+goose Down/{flag=0} flag' \
+            migrations/001_init.sql \
+            | psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+          psql "$DATABASE_URL" -c '\dt'
+
+      # -race because these tests spawn concurrent goroutines against the DB; a
+      # lock or context bug in the store would show as a race, not just a failure.
+      - name: Test store (race, live DB)
+        run: go test -race -count=1 -v ./internal/store/

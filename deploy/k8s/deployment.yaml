@@ -1,0 +1,182 @@
+# Kubernetes manifests for llmchat.
+#
+# Apply with:  kubectl apply -f deploy/k8s/
+#
+# The two probes are the part worth reading. Getting them wrong is the most
+# common cause of a cascading outage that *starts* as a healthy cluster.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llmchat-config
+data:
+  ADDR: ":8080"
+  INTERNAL_ADDR: ":9090"
+  LLM_PROVIDER: "openai"
+  # Example targets the ECNU gateway; swap base URL + key for any
+  # OpenAI-compatible endpoint. ecnu-plus / ecnu-max are the two live aliases.
+  OPENAI_BASE_URL: "https://chat.ecnu.edu.cn/open/api/v1"
+  LLM_MODEL: "ecnu-plus"
+  CTX_STRATEGY: "hybrid"
+  # Sized for a 128k-window model with a conservative generation budget. A
+  # smaller model needs a smaller value or the packer will build prompts the
+  # provider rejects; config.Load refuses to start when reserves exceed the
+  # window, so a wrong value fails loudly at boot rather than at 3am.
+  CTX_MAX_TOKENS: "32000"
+  CTX_RESERVE_REPLY: "4096"
+  CTX_RESERVE_INPUT: "2048"
+  CTX_PIN_FIRST: "true"
+  ALLOWED_ORIGINS: "https://app.example.com"
+  # Keep this below terminationGracePeriodSeconds below. Grace must outlast
+  # graceful shutdown, or the kubelet SIGKILLs mid-drain.
+  SHUTDOWN_GRACE: "15s"
+---
+# Secrets hold the DSN and API key. Create out of band:
+#   kubectl create secret generic llmchat-secrets \
+#     --from-literal=DATABASE_URL="$DATABASE_URL" \
+#     --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY" \
+#     --from-literal=REDIS_URL="$REDIS_URL"
+apiVersion: v1
+kind: Secret
+metadata:
+  name: llmchat-secrets
+type: Opaque
+stringData:
+  DATABASE_URL: "postgres://llmchat:CHANGE_ME@postgres:5432/llmchat?sslmode=require"
+  OPENAI_API_KEY: "CHANGE_ME"
+  REDIS_URL: "redis://redis:6379/0"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llmchat
+  labels:
+    app: llmchat
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: llmchat
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: llmchat
+    spec:
+      # Must exceed the longest generation you are willing to serve. A streaming
+      # response is an in-flight request: with a short grace period the kubelet
+      # sends SIGKILL while tokens are still being forwarded, and every user
+      # mid-reply sees a truncated answer. Grace also has to cover SHUTDOWN_GRACE.
+      terminationGracePeriodSeconds: 180
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+      containers:
+        - name: server
+          image: ghcr.io/CHANGE_ME/llmchat:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+          envFrom:
+            - configMapRef:
+                name: llmchat-config
+            - secretRef:
+                name: llmchat-secrets
+          # ---- liveness: process health ONLY ----
+          # This must not depend on Postgres. If it did, a 30-second database
+          # failover would make every pod report unhealthy at once, the kubelet
+          # would kill them all, and the restart storm would hit a database that
+          # is already struggling. The app restarting cannot fix a down database;
+          # it can only remove capacity. liveness answers "is this process wedged"
+          # and nothing else.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            # Generous: a false positive here kills a working pod.
+            failureThreshold: 6
+          # ---- readiness: can this pod usefully serve traffic ----
+          # Checking the database here is correct and safe: failing readiness only
+          # pulls the pod from Service endpoints, so new requests stop arriving
+          # while existing streams finish. The pod is not restarted, so it rejoins
+          # automatically when the database recovers.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+              # CPU is deliberately left unset. A CPU limit throttles a container
+              # mid-stream and adds latency jitter to every token; requests-only
+              # scheduling keeps burst capacity available. Memory must still be
+              # limited, because it is not compressible.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llmchat
+  labels:
+    app: llmchat
+spec:
+  type: ClusterIP
+  selector:
+    app: llmchat
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: llmchat
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: llmchat
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      # A chat request holds an open SSE stream for as long as the model
+      # generates. Scaling down aggressively mid-generation kills those streams;
+      # a 10-minute stabilisation window makes downscaling wait for quiet periods.
+      stabilizationWindowSeconds: 600

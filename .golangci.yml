@@ -1,0 +1,55 @@
+# golangci-lint v2 configuration.
+version: "2"
+
+linters:
+  enable:
+    # Correctness first: these catch real bugs, not style.
+    - govet
+    - errcheck      # an unchecked error is how the summary bug hid
+    - errorlint     # %v on an error loses the chain; use %w
+    - bodyclose     # leaked response bodies exhaust the connection pool
+    - noctx         # http.NewRequest without ctx defeats cancellation
+    - staticcheck
+    - unused
+    - gosimple
+    - ineffassign
+    - copyloopvar
+    # Design signals worth defending in review.
+    - gocritic
+    - revive
+    - misspell
+  settings:
+    errcheck:
+      # `_ = f()` is an explicit, reviewable choice. Silent ignores are not.
+      check-blank: false
+    revive:
+      rules:
+        - name: exported
+          arguments:
+            - disable-stuttering-check
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+      disabled-checks:
+        # HugeParam/paramTypeCombine fight the explicit struct style here.
+        - hugeParam
+        - rangeValCopy
+    govet:
+      enable-all: true
+      disable:
+        # Field alignment is irrelevant until you are packing a hot struct.
+        - fieldalignment
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/dylin/llmchat
+
+run:
+  timeout: 5m
+  tests: true

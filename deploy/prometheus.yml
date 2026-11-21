@@ -1,0 +1,35 @@
+# Prometheus scrape config for the llmchat local stack.
+# Mounted read-only into the prometheus container at
+# /etc/prometheus/prometheus.yml (see docker-compose.yml).
+
+global:
+  # A scrape every 15s is plenty for a dev box and keeps TSDB small.
+  scrape_interval: 15s
+  # Generation metrics (time_to_first_token_seconds, active_streams) move on
+  # human timescales; no need to scrape faster than a user notices.
+  evaluation_interval: 15s
+  external_labels:
+    env: local
+    stack: llmchat
+
+scrape_configs:
+  # Prometheus scraping its own /metrics — the standard self-observability job.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # The llmchat server. /metrics is served ONLY on the internal listener
+  # (INTERNAL_ADDR :9090), never on the public ADDR :8080 router — see
+  # observability.Handler(), which is deliberately kept off the public mux so
+  # metrics are not internet-exposed. Over the compose network the container's
+  # internal port is reached as server:9090; that does not collide with the
+  # Prometheus UI above because the server container does not publish its 9090.
+  - job_name: llmchat
+    metrics_path: /metrics
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["server:9090"]
+        labels:
+          service: llmchat
+          # The app's own internal listener; the public API (:8080) has no
+          # /metrics route, so never target it here.

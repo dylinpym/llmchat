@@ -1,0 +1,12 @@
+# 统一按 LF 存储，避免 Windows 下 CRLF 混进仓库。
+# Go 源码、CI 配置、脚本如果在仓库里是 CRLF，Linux 的 CI 可能出问题
+# （比如 shell 脚本带 \r 会报 "bad interpreter"）。
+* text=auto eol=lf
+
+# 二进制文件不做换行转换
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.gz binary

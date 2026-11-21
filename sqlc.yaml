@@ -1,0 +1,34 @@
+version: "2"
+
+sql:
+  - engine: postgresql
+    queries: db/query
+    schema: migrations
+    gen:
+      go:
+        # Generated code is committed so `go build` needs no sqlc installed.
+        package: sqlcgen
+        out: internal/store/sqlcgen
+        sql_package: pgx/v5
+        emit_exact_table_names: false
+        emit_methods_with_db_argument: false
+        emit_result_struct_pointers: false
+        emit_interface: false
+        emit_prepared_queries: false
+        emit_json_tags: false
+        # pgx scans these natively; without the overrides sqlc maps uuid to a
+        # byte slice and jsonb to string, which forces conversion noise in
+        # every caller.
+        overrides:
+          - db_type: uuid
+            go_type: github.com/google/uuid.UUID
+          - db_type: pg_catalog.uuid
+            go_type: github.com/google/uuid.UUID
+          - db_type: jsonb
+            go_type:
+              type: byte
+              slice: true
+          - db_type: pg_catalog.jsonb
+            go_type:
+              type: byte
+              slice: true

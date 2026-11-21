@@ -1,0 +1,180 @@
+# docker-compose.yml — full local stack for llmchat (Windows dev machine).
+#
+# PORT POLICY ON THIS HOST
+#   * 3306 is OFF LIMITS — something (likely MySQL) already listens there. Postgres
+#     uses its native 5432, so there is no collision by design; 3306 is never mapped.
+#   * Standard ports are used for every service: Postgres 5432, Redis 6379,
+#     Prometheus 9090, Grafana 3000, MinIO 9000/9001, server 8080.
+#   * The server's public (8080) and internal (9090) ports are deliberately NOT
+#     published to the host — see the `server` service below. The in-cluster
+#     Prometheus container scrapes the server over the compose network, so no host
+#     binding is needed and the app's INTERNAL_ADDR :9090 never fights the
+#     Prometheus UI's 9090.
+#   * Everything that IS published binds to 127.0.0.1 only, so nothing is exposed
+#     on the LAN/Wi-Fi adapter of a Windows laptop.
+#
+# COPY .env.example TO .env FIRST. Compose reads .env to expand ${VAR}; the
+# DATABASE_URL handed to the server must use the POSTGRES_* credentials defined
+# under x-postgres-creds (the `server` container reaches Postgres by service name
+# `postgres`, not `localhost`).
+
+# Single source of truth for Postgres credentials. Compose injects these into BOTH
+# the postgres container and the server's DATABASE_URL, so the two can never drift.
+x-postgres-creds: &postgres-creds
+  POSTGRES_USER: ${POSTGRES_USER:-llmchat}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-llmchat}
+  POSTGRES_DB: ${POSTGRES_DB:-llmchat}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: llmchat-postgres
+    # 5432, NOT 3306 — 3306 is taken on this host. Bound to loopback only.
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment: *postgres-creds
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready run as the configured superuser against the configured DB.
+      # `|| exit 1` is redundant (pg_isready already exits non-zero when down)
+      # but makes the intent obvious and survives image changes to the shell.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-llmchat} -d ${POSTGRES_DB:-llmchat} || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: llmchat-redis
+    ports:
+      - "127.0.0.1:6379:6379"
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: llmchat-prometheus
+    # 9090 is Prometheus' own UI/metrics port. The app's INTERNAL_ADDR is also
+    # :9090 but stays unpublished on the server container, so no host conflict.
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      # Read-only single-file bind of the scrape config.
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    depends_on:
+      - server
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: llmchat-grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      # ---- DEV ONLY -----------------------------------------------------------
+      # Anonymous access with the Editor role means you can open Grafana at
+      # http://127.0.0.1:3000 and browse with no login. This removes auth entirely
+      # and MUST NOT be used outside a loopback-only local stack. Remove these
+      # four vars (and un-publish the port) for anything real.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Editor"
+      GF_AUTH_ANONYMOUS_ORG_NAME: "Main Org."
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      # A datasource is not auto-provisioned here (no provisioning files); add
+      # Prometheus manually in the UI, URL http://prometheus:9090.
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    container_name: llmchat-minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    ports:
+      - "127.0.0.1:9000:9000"   # S3 API
+      - "127.0.0.1:9001:9001"   # web console
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: llmchat/server:local
+    container_name: llmchat-server
+    # ---- Why NO `ports:` here ----
+    # The app binds ADDR=:8080 and INTERNAL_ADDR=:9090. Neither is published:
+    #   * Prometheus scrapes http://server:9090/metrics over the compose network,
+    #     so the internal metrics port never needs a host binding — and never
+    #     collides with the Prometheus UI that already owns host :9090.
+    #   * The public API is reached through a reverse proxy in real deployments.
+    # To reach the API straight from a Windows browser during development,
+    # uncomment a loopback mapping (8080 is free on this host):
+    # ports:
+    #   - "127.0.0.1:8080:8080"
+    environment:
+      # config.Load() keys — these names are fixed by internal/config/config.go.
+      ADDR: ":8080"
+      INTERNAL_ADDR: ":9090"
+      # DATABASE_URL MUST use the service name `postgres` and the same POSTGRES_*
+      # creds the postgres container was created with (from x-postgres-creds).
+      DATABASE_URL: "postgres://${POSTGRES_USER:-llmchat}:${POSTGRES_PASSWORD:-llmchat}@postgres:5432/${POSTGRES_DB:-llmchat}?sslmode=disable"
+      REDIS_URL: "redis://redis:6379/0"
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      # Never commit a key; supply via .env. Empty is fine for LLM_PROVIDER=mock.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-ecnu-plus}
+      LLM_SUMMARY_MODEL: ${LLM_SUMMARY_MODEL:-}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+      SHUTDOWN_GRACE: ${SHUTDOWN_GRACE:-15s}
+      CTX_STRATEGY: ${CTX_STRATEGY:-truncate}
+      CTX_MAX_TOKENS: ${CTX_MAX_TOKENS:-32000}
+      CTX_RESERVE_REPLY: ${CTX_RESERVE_REPLY:-4096}
+      CTX_RESERVE_INPUT: ${CTX_RESERVE_INPUT:-2048}
+      CTX_PIN_FIRST: ${CTX_PIN_FIRST:-true}
+    # Only start once Postgres has actually passed its pg_isready healthcheck,
+    # so the pool doesn't fail its first connection during DB init.
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+  minio_data:
