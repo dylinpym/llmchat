@@ -1,8 +1,8 @@
 # llmchat
 
-<!-- push 之后把下面的 OWNER/REPO 换成你的 GitHub 用户名/仓库名；workflow 文件位于
-     .github/workflows/ci.yml。触发分支同时接受 main 和 master，所以你设哪个默认分支都能跑。 -->
-[![CI](https://github.com/OWNER/REPO/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/ci.yml)
+<!-- CI 徽章指向实际仓库。workflow 在 .github/workflows/ci.yml，
+     触发分支同时接受 main 和 master。 -->
+[![CI](https://github.com/dylinpym/llmchat/actions/workflows/ci.yml/badge.svg)](https://github.com/dylinpym/llmchat/actions/workflows/ci.yml)
 
 一个聊天后端，围绕 LLM 应用真正的难点构建：**对话历史是无限的，上下文窗口不是。**
 
