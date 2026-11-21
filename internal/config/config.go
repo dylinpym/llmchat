@@ -19,7 +19,15 @@ type Config struct {
 	Addr         string
 	InternalAddr string
 	DatabaseURL  string
-	RedisURL     string
+
+	// RedisURL is parsed but not yet used by anything. It is reserved for the
+	// token-budget limiter on the roadmap, which needs atomic cross-instance
+	// counters with expiry — a job Postgres does badly, since every quota check
+	// would open a transaction and the pool is already the first bottleneck
+	// under load. The value is kept, not deleted, because docker-compose and
+	// the README both reference it; dropping the field would leave the docs
+	// describing a setting the binary no longer reads.
+	RedisURL string
 
 	Provider      string // "openai" | "mock"
 	OpenAIBaseURL string
